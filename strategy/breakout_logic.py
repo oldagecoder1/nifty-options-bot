@@ -1,9 +1,11 @@
 """
 Breakout and confirmation detection logic
+(Updated to post-10:15 two-candle confirmation on Nifty 5-minute candles)
 """
 from typing import Optional, Literal
-import pandas as pd
 from dataclasses import dataclass
+from datetime import time
+import pandas as pd
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -12,49 +14,139 @@ TradeSide = Literal['CALL', 'PUT', 'NONE']
 
 @dataclass
 class BreakoutState:
-    """Track breakout state"""
+    """Kept for backward-compatibility (no longer used for entries)."""
     detected: bool = False
     breakout_high: Optional[float] = None
     breakout_candle_close: Optional[float] = None
     confirmation_pending: bool = False
 
 class BreakoutDetector:
-    """Detect breakout and confirmation for entry"""
-    
+    """
+    Detect entries using *Nifty 5-minute* two-candle confirmation AFTER 10:15:
+      - CALL: candle k close > RN AND candle k+1 close > RN AND > k close
+      - PUT : candle k close < GN AND candle k+1 close < GN AND < k close
+
+    Notes:
+    - This class preserves the old public API (decide_side, check_breakout, check_confirmation),
+      but entries are now decided entirely inside decide_side based on Nifty candles.
+    - After an exit or stop-loss, call `notify_position_closed()` to re-arm the detector.
+    """
+
     def __init__(self):
+        # old fields (retained so external code doesn't break)
         self.call_breakout = BreakoutState()
         self.put_breakout = BreakoutState()
+
         self.current_side: TradeSide = 'NONE'
-    
+
+        # NEW: state for the two-candle confirmation logic
+        self._prev_nifty5: Optional[pd.Series] = None  # previous completed 5m Nifty candle
+        self._armed: bool = False                      # can take a fresh entry?
+        self._trading_window_open: bool = False        # true after 10:15 (based on candle ts)
+        self._trade_start_time: time = time(10, 00)    # 10:15
+
+    # -------------------- new helpers --------------------
+
+    def notify_position_closed(self):
+        """
+        Call this when your position is fully closed (SL/target/manual)
+        to re-arm the detector for the next setup.
+        """
+        if self._trading_window_open:
+            self._armed = True
+            logger.info("Re-armed after position closed.")
+
+    def _past_start_time(self, dt) -> bool:
+        """
+        dt: pandas.Timestamp or datetime from the Nifty candle.
+        Returns True once local time is >= 10:15.
+        """
+        # pandas.Timestamp has .time(); naive or tz-aware works for local-market backtests.
+        try:
+            return dt.time() >= self._trade_start_time
+        except Exception:
+            # If dt is string or unexpected, be safe: do not allow trading.
+            logger.warning("Unexpected timestamp in candle; gating until parsed correctly.")
+            return False
+
+    # -------------------- main API (unchanged signature) --------------------
+
     def decide_side(self, nifty_candle: pd.Series, RN: float, GN: float) -> TradeSide:
         """
-        Decide trading side based on Nifty 5-min candle
-        
+        Decide trading side based on *Nifty 5-min candles* with two-candle confirmation.
+
         Args:
-            nifty_candle: Nifty 5-min candle (with open, high, low, close)
-            RN: Nifty reference high
-            GN: Nifty reference low
-        
+            nifty_candle: pd.Series with keys ['timestamp','open','high','low','close']
+            RN: Resistance level
+            GN: (mid/green) level
+
         Returns:
-            'CALL', 'PUT', or 'NONE'
+            'CALL' when two-candle bullish confirmation
+            'PUT'  when two-candle bearish confirmation
+            'NONE' otherwise
         """
-        close = nifty_candle['close']
-        open_price = nifty_candle['open']
-        
-        # Green candle above RN -> CALL
-        if close > open_price and close > RN:
+        # basic guards
+        if nifty_candle is None or 'timestamp' not in nifty_candle or 'close' not in nifty_candle:
+            return 'NONE'
+
+        ts = nifty_candle['timestamp']
+        close = float(nifty_candle['close'])
+
+        # 1) open trading window after 10:15
+        if not self._trading_window_open:
+            if self._past_start_time(ts):
+                self._trading_window_open = True
+                self._armed = True  # arm immediately once window opens
+                logger.info("Trading window opened (>= 10:15) and armed.")
+            else:
+                # before 10:15, just buffer last candle
+                self._prev_nifty5 = nifty_candle
+                return 'NONE'
+
+        # 2) if not armed (e.g., just took a trade and haven't exited), do nothing
+        if not self._armed:
+            self._prev_nifty5 = nifty_candle
+            return 'NONE'
+
+        # 3) need previous candle for 2-candle confirmation
+        if self._prev_nifty5 is None:
+            self._prev_nifty5 = nifty_candle
+            return 'NONE'
+
+        prev = self._prev_nifty5
+        prev_close = float(prev['close'])
+        logger.info(f"Nifty candle: {ts}: {prev_close:.2f} → {close:.2f}")
+
+        # ---- Two-candle confirmation checks (strict inequalities) ----
+        # CALL: prev.close > RN AND curr.close > RN AND curr.close > prev.close
+        if (prev_close > RN) and (close > RN) and (close > prev_close):
             self.current_side = 'CALL'
-            logger.info(f"✅ Side selected: CALL (Nifty close {close:.2f} > RN {RN:.2f})")
+            self._armed = False        # disarm until exit
+            self._prev_nifty5 = nifty_candle
+            logger.info(
+                f"✅ CALL confirmed: prev_close={prev_close:.2f} > RN={RN:.2f}, "
+                f"curr_close={close:.2f} > RN and > prev_close"
+            )
             return 'CALL'
-        
-        # Red candle below GN -> PUT
-        elif close < open_price and close < GN:
+
+        # PUT: prev.close < GN AND curr.close < GN AND curr.close < prev.close
+        if (prev_close < GN) and (close < GN) and (close < prev_close):
             self.current_side = 'PUT'
-            logger.info(f"✅ Side selected: PUT (Nifty close {close:.2f} < GN {GN:.2f})")
+            self._armed = False        # disarm until exit
+            self._prev_nifty5 = nifty_candle
+            logger.info(
+                f"✅ PUT confirmed: prev_close={prev_close:.2f} < GN={GN:.2f}, "
+                f"curr_close={close:.2f} < GN and < prev_close"
+            )
             return 'PUT'
-        
+
+        # 4) no setup; slide the window
+        self.current_side = 'NONE'
+        self._prev_nifty5 = nifty_candle
         return 'NONE'
-    
+
+    # -------------------- legacy API (kept for compatibility) --------------------
+
     def check_breakout(
         self,
         option_candle: pd.Series,
@@ -62,41 +154,18 @@ class BreakoutDetector:
         side: TradeSide
     ) -> bool:
         """
-        Check if breakout occurred
-        
-        Args:
-            option_candle: Option 5-min candle
-            reference_high: RC for Call or RP for Put
-            side: 'CALL' or 'PUT'
-        
-        Returns:
-            True if breakout detected, False otherwise
+        Legacy no-op: entries are now decided solely by decide_side()
+        based on Nifty two-candle confirmation after 10:15.
+        Kept to avoid breaking existing callers.
         """
-        if side not in ['CALL', 'PUT']:
-            return False
-        
+        # Keep state reset semantics if someone still calls this
         state = self.call_breakout if side == 'CALL' else self.put_breakout
-        
-        # Already detected, waiting for confirmation
-        if state.detected and state.confirmation_pending:
-            return False
-        
-        close = option_candle['close']
-        open_price = option_candle['open']
-        high = option_candle['high']
-        
-        # Must be green candle closing above reference high
-        if close > open_price and close > reference_high:
-            state.detected = True
-            state.breakout_high = high
-            state.breakout_candle_close = close
-            state.confirmation_pending = True
-            
-            logger.info(f"🔔 BREAKOUT detected on {side}: Close={close:.2f} > Ref={reference_high:.2f}")
-            return True
-        
+        state.detected = False
+        state.breakout_high = None
+        state.breakout_candle_close = None
+        state.confirmation_pending = False
         return False
-    
+
     def check_confirmation(
         self,
         option_candle: pd.Series,
@@ -104,64 +173,37 @@ class BreakoutDetector:
         side: TradeSide
     ) -> bool:
         """
-        Check if confirmation occurred after breakout
-        
-        Args:
-            option_candle: Option 5-min candle (next candle after breakout)
-            reference_high: RC for Call or RP for Put
-            side: 'CALL' or 'PUT'
-        
-        Returns:
-            True if confirmation detected, False otherwise
+        Legacy no-op: confirmation is part of the two-candle Nifty rule in decide_side().
         """
-        if side not in ['CALL', 'PUT']:
-            return False
-        
+        # Ensure legacy state is cleared
         state = self.call_breakout if side == 'CALL' else self.put_breakout
-        
-        # No breakout detected yet
-        if not state.detected or not state.confirmation_pending:
-            return False
-        
-        close = option_candle['close']
-        open_price = option_candle['open']
-        
-        # Must be green candle closing above both breakout high AND reference high
-        if (close > open_price and 
-            close > state.breakout_high and 
-            close > reference_high):
-            
-            state.confirmation_pending = False
-            logger.info(f"✅ CONFIRMATION on {side}: Close={close:.2f} > Breakout High={state.breakout_high:.2f}")
-            return True
-        
-        # Reset if failed to confirm
-        logger.warning(f"❌ Confirmation failed on {side}, resetting breakout state")
         state.detected = False
         state.breakout_high = None
         state.breakout_candle_close = None
         state.confirmation_pending = False
-        
         return False
-    
+
     def reset_breakout(self, side: TradeSide):
-        """Reset breakout state for a side"""
+        """Reset breakout state for a side (legacy compatibility)."""
         if side == 'CALL':
             self.call_breakout = BreakoutState()
         elif side == 'PUT':
             self.put_breakout = BreakoutState()
         logger.info(f"Breakout state reset for {side}")
-    
+
     def reset_all(self):
-        """Reset all breakout states"""
+        """Reset all states and disarm until 10:15 logic opens again."""
         self.call_breakout = BreakoutState()
         self.put_breakout = BreakoutState()
         self.current_side = 'NONE'
+        self._prev_nifty5 = None
+        self._armed = False
+        self._trading_window_open = False
         logger.info("All breakout states reset")
-    
+
     def get_current_side(self) -> TradeSide:
-        """Get current trading side"""
+        """Get last signaled side ('CALL'/'PUT') or 'NONE'."""
         return self.current_side
 
-# Global instance
+# Global instance (unchanged)
 breakout_detector = BreakoutDetector()

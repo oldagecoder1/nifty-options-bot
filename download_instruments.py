@@ -89,7 +89,7 @@ def main():
         df_mapped = df_mapped.sort_values(['expiry', 'strike', 'option_type'])
         
         # Save to CSV
-        output_path = 'data/instruments.csv'
+        output_path = 'data/instruments_06_10.csv'
         os.makedirs('data', exist_ok=True)
         df_mapped.to_csv(output_path, index=False)
         

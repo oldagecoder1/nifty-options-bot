@@ -12,7 +12,7 @@ import os
 sys.path.insert(0, os.path.abspath('.'))
 
 from config.settings import settings
-from utils.logger import setup_logger
+from utils.logger import setup_logger, get_logger
 from utils.candle_aggregator import candle_aggregator
 from data.broker_api import broker_api
 from data.instruments import instrument_manager
@@ -24,7 +24,9 @@ from strategy.indicators import get_latest_rsi, track_rsi_peak, check_rsi_exit_c
 from execution.paper_trading import paper_trading_manager
 from utils.helpers import generate_trade_id
 
-logger = setup_logger('HistoricalTest', './logs/historical_test.log', 'INFO')
+root_logger = setup_logger('', './logs/historical_test.log', 'INFO') 
+
+logger = get_logger('HistoricalTest') 
 
 class HistoricalTester:
     """Test bot with historical 1-minute candles"""
@@ -92,15 +94,52 @@ class HistoricalTester:
                 'close': row['nifty_close'],
                 'timestamp': candle_time
             }
+            call_candle = {
+                'open': row['call_open'],
+                'high': row['call_high'],
+                'low': row['call_low'],
+                'close': row['call_close'],
+                'timestamp': candle_time,
+                'token': self.call_token
+            }
+            candle_aggregator.completed_1min_candles[self.call_token].append(call_candle)
             
+            broker_api.latest_ticks[self.call_token] = {
+                'ltp': row['call_close'],
+                'open': row['call_open'],
+                'high': row['call_high'],
+                'low': row['call_low'],
+                'close': row['call_close'],
+                'timestamp': candle_time
+            }
+            
+            # Add Put candle
+            put_candle = {
+                'open': row['put_open'],
+                'high': row['put_high'],
+                'low': row['put_low'],
+                'close': row['put_close'],
+                'timestamp': candle_time,
+                'token': self.put_token
+            }
+            candle_aggregator.completed_1min_candles[self.put_token].append(put_candle)
+            
+            broker_api.latest_ticks[self.put_token] = {
+                'ltp': row['put_close'],
+                'open': row['put_open'],
+                'high': row['put_high'],
+                'low': row['put_low'],
+                'close': row['put_close'],
+                'timestamp': candle_time
+            }
             # Check if we should calculate reference levels
             if not self.reference_levels_set:
-                if candle_time.time() >= pd.Timestamp('10:15').time():
+                if candle_time.time() >= pd.Timestamp('10:00').time():
                     self._calculate_reference_levels()
             
             # Select strikes at 10:15
             if self.reference_levels_set and not self.strikes_selected:
-                if candle_time.time() >= pd.Timestamp('10:15').time():
+                if candle_time.time() >= pd.Timestamp('10:00').time():
                     self._select_strikes(row)
             
             # If strikes selected, add option candles
@@ -162,7 +201,7 @@ class HistoricalTester:
         paper_trading_manager.print_summary()
     
     def _calculate_reference_levels(self):
-        """Calculate reference from 10:00-10:15"""
+        """Calculate reference from 09:45-10:00"""
         logger.info("⏰ Calculating reference levels...")
         
         # Get first candle date and timezone
@@ -170,8 +209,8 @@ class HistoricalTester:
         tz = first_date.tz  # Preserve timezone from data
         
         # Create timestamps with same timezone as data
-        start_time = pd.Timestamp(f"{first_date.date()} 10:00:00", tz=tz)
-        end_time = pd.Timestamp(f"{first_date.date()} 10:15:00", tz=tz)
+        start_time = pd.Timestamp(f"{first_date.date()} 09:45:00", tz=tz)
+        end_time = pd.Timestamp(f"{first_date.date()} 10:00:00", tz=tz)
         
         # Get Nifty candles
         nifty_df = candle_aggregator.get_candles_for_period(
@@ -203,8 +242,8 @@ class HistoricalTester:
         first_date = self.data['datetime'].iloc[0]
         tz = first_date.tz
         
-        start_time = pd.Timestamp(f"{first_date.date()} 10:00:00", tz=tz)
-        end_time = pd.Timestamp(f"{first_date.date()} 10:15:00", tz=tz)
+        start_time = pd.Timestamp(f"{first_date.date()} 09:45:00", tz=tz)
+        end_time = pd.Timestamp(f"{first_date.date()} 10:00:00", tz=tz)
         
         nifty_df = candle_aggregator.get_candles_for_period(self.nifty_token, start_time, end_time, '1min')
         call_df = candle_aggregator.get_candles_for_period(self.call_token, start_time, end_time, '1min')
@@ -215,60 +254,87 @@ class HistoricalTester:
             logger.info("✅ Reference recalculated with option data")
     
     def _process_5min_candle(self, candle_time):
-        """Process every 5 minutes"""
-        # Build 5-min candle from last 5 1-min candles
-        # Use timezone-aware timestamp
-        start_time = candle_time - pd.Timedelta(minutes=5)
-        
+        """Process every 5 minutes: build 5-min Nifty candle and drive entries."""
+        # Build 5-min candle from the last 5 x 1-min candles (inclusive)
+        # Example: at 10:25, we want 10:21..10:25 (5 bars) → subtract 4 minutes
+        start_time = candle_time - pd.Timedelta(minutes=4)
+
         levels = reference_calculator.get_levels()
         if not levels:
             return
-        
-        # Get 5-min candle for Nifty
+
+        # --- Nifty 5-min candle ---
         nifty_candles = candle_aggregator.get_candles_for_period(
             self.nifty_token, start_time, candle_time, '1min'
         )
-        
-        if len(nifty_candles) > 0:
-            nifty_5min = {
-                'open': nifty_candles.iloc[0]['open'],
-                'high': nifty_candles['high'].max(),
-                'low': nifty_candles['low'].min(),
-                'close': nifty_candles.iloc[-1]['close']
-            }
-            
-            # Decide side
-            if not self.in_position:
-                side = breakout_detector.decide_side(pd.Series(nifty_5min), levels.RN, levels.GN)
-                
-                if side != 'NONE':
-                    # Check option candle
-                    option_token = self.call_token if side == 'CALL' else self.put_token
-                    option_candles = candle_aggregator.get_candles_for_period(
-                        option_token, start_time, candle_time, '1min'
-                    )
-                    
-                    if len(option_candles) > 0:
-                        option_5min = {
-                            'open': option_candles.iloc[0]['open'],
-                            'high': option_candles['high'].max(),
-                            'low': option_candles['low'].min(),
-                            'close': option_candles.iloc[-1]['close']
-                        }
-                        
-                        ref_high = levels.RC if side == 'CALL' else levels.RP
-                        
-                        # Check breakout/confirmation
-                        if breakout_detector.check_breakout(pd.Series(option_5min), ref_high, side):
-                            logger.info(f"🔔 Breakout on {side}")
-                        
-                        if breakout_detector.check_confirmation(pd.Series(option_5min), ref_high, side):
-                            self._enter_trade(side, option_5min['close'], levels)
-            
-            # Manage position
-            if self.in_position:
-                self._manage_position(candle_time)
-    
+        if len(nifty_candles) == 0:
+            return
+
+        nifty_5min = {
+            'open': float(nifty_candles.iloc[0]['open']),
+            'high': float(nifty_candles['high'].max()),
+            'low':  float(nifty_candles['low'].min()),
+            'close': float(nifty_candles.iloc[-1]['close']),
+            'timestamp': candle_time,  # IMPORTANT for >=10:15 gating in decide_side
+        }
+
+        # --- Entry logic: only when NOT in a position ---
+        if not self.in_position:
+            # New rule: two-candle confirmation on Nifty 5-min after 10:15
+            side = breakout_detector.decide_side(pd.Series(nifty_5min), levels.RN, levels.GN)
+
+            if side != 'NONE':
+                # Build option 5-min candle to get entry price (no breakout/confirm on options now)
+                option_token = self.call_token if side == 'CALL' else self.put_token
+                option_candles = candle_aggregator.get_candles_for_period(
+                    option_token, start_time, candle_time, '1min'
+                )
+                if len(option_candles) == 0:
+                    return
+
+                option_5min = {
+                    'open': float(option_candles.iloc[0]['open']),
+                    'high': float(option_candles['high'].max()),
+                    'low':  float(option_candles['low'].min()),
+                    'close': float(option_candles.iloc[-1]['close']),
+                    'timestamp': candle_time,
+                }
+
+                # Directly enter using option 5-min close (your SL/TS logic remains unchanged)
+                self._enter_trade(side, option_5min['close'], levels)
+
+        # --- Manage open position (unchanged) ---
+        if self.in_position:
+            self._manage_position(candle_time)
+
+    def _calculate_option_rsi(self, token: int, upto_time: pd.Timestamp) -> float | None:
+        """Calculate 5-min RSI for the given option token up to a specific time."""
+        if not token:
+            return None
+
+        option_df = candle_aggregator.get_candles(token, interval='1min')
+        if option_df.empty:
+            return None
+
+        option_df = option_df[option_df.index <= upto_time]
+        if option_df.empty:
+            return None
+
+        option_df = option_df.sort_index()
+        option_df = option_df.tail(120)
+
+        option_5min = (
+            option_df
+            .resample('5min', label='right', closed='right')
+            .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'})
+            .dropna()
+        )
+
+        if len(option_5min) < 15:
+            return None
+
+        return get_latest_rsi(option_5min, price_column='close', period=14)
+
     def _enter_trade(self, side, entry_price, levels):
         """Enter trade"""
         trade_id = generate_trade_id(side, entry_price)
@@ -292,6 +358,7 @@ class HistoricalTester:
         self.current_trade_id = trade_id
         self.current_side = side
         self.entry_price = entry_price
+        self.rsi_peak = None
         
         logger.info(f"✅ ENTERED {side} @ {entry_price}")
     
@@ -305,6 +372,15 @@ class HistoricalTester:
         
         current_price = tick['ltp']
         current_low = tick['low']
+        
+        # Update RSI for trailing exit
+        current_rsi = self._calculate_option_rsi(token, candle_time)
+        if current_rsi is not None:
+            self.rsi_peak = track_rsi_peak(current_rsi, self.rsi_peak)
+            if check_rsi_exit_condition(current_rsi, self.rsi_peak, drop_threshold=settings.RSI_EXIT_DROP):
+                logger.info(f"📉 RSI EXIT triggered | Current RSI: {current_rsi:.2f} | Peak RSI: {self.rsi_peak:.2f}")
+                self._exit_trade(current_price, 'RSI_EXIT')
+                return
         
         # Update SL
         if not stop_loss_manager.is_breakeven_reached():
