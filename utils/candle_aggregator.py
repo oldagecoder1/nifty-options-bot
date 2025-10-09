@@ -5,9 +5,9 @@ from typing import Dict, Optional
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pandas as pd
-from utils.logger import get_logger
+from utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger('CandleAggregator', level='INFO')
 
 class CandleAggregator:
     """Aggregate ticks into 1-minute and 5-minute candles"""
@@ -24,6 +24,30 @@ class CandleAggregator:
         # Callbacks for when candles complete
         self.on_1min_candle_callbacks = []
         self.on_5min_candle_callbacks = []
+        
+        # Token to instrument name mapping
+        self.token_instrument_names = {}  # {token: instrument_name}
+        
+        # Data storage instance (lazy loaded to avoid circular imports)
+        self._data_storage = None
+    
+    @property
+    def data_storage(self):
+        """Lazy load data storage to avoid circular imports"""
+        if self._data_storage is None:
+            from utils.data_storage import data_storage
+            self._data_storage = data_storage
+        return self._data_storage
+    
+    def register_instrument_name(self, token: int, instrument_name: str):
+        """
+        Register instrument name for a token
+        
+        Args:
+            token: Instrument token
+            instrument_name: Name of the instrument (e.g., 'NIFTY50', 'NIFTY24JAN25000CE')
+        """
+        self.token_instrument_names[token] = instrument_name
     
     def add_tick(self, token: int, ltp: float, timestamp: datetime):
         """
@@ -40,6 +64,118 @@ class CandleAggregator:
         # Update 5-minute candle
         self._update_candle(token, ltp, timestamp, interval_minutes=5)
     
+    def add_historical_candle(self, token: int, candle_data: Dict, timestamp: datetime, trigger_callbacks: bool = True):
+        """
+        Add a complete historical 1-minute candle directly (for historical data loading)
+        
+        Args:
+            token: Instrument token
+            candle_data: Dict with 'open', 'high', 'low', 'close' keys
+            timestamp: Candle timestamp
+            trigger_callbacks: Whether to trigger callbacks when 5-min candles complete (default: True)
+        """
+        # Convert to timezone-naive if needed
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
+        
+        # Round timestamp to 1-minute interval
+        candle_time = timestamp.replace(second=0, microsecond=0)
+        
+        # Create complete 1-minute candle
+        candle = {
+            'open': candle_data['open'],
+            'high': candle_data['high'],
+            'low': candle_data['low'],
+            'close': candle_data['close'],
+            'timestamp': candle_time,
+            'token': token
+        }
+        
+        # Add to completed 1-minute candles
+        self.completed_1min_candles[token].append(candle.copy())
+        
+        # Save to CSV
+        instrument_name = self.token_instrument_names.get(token)
+        self.data_storage.save_1min_candle(token, candle.copy(), instrument_name)
+        
+        # Also update 5-minute candle aggregation from this 1-min candle
+        # We need to properly aggregate the OHLC data, not just use close price
+        self._update_candle_with_ohlc(token, candle_data, timestamp, interval_minutes=5, trigger_callbacks=trigger_callbacks)
+    
+    def _update_candle_with_ohlc(self, token: int, candle_data: Dict, timestamp: datetime, interval_minutes: int, trigger_callbacks: bool = True):
+        """
+        Update candle with complete OHLC data (for historical data aggregation)
+        
+        Args:
+            token: Instrument token
+            candle_data: Dict with 'open', 'high', 'low', 'close' keys
+            timestamp: Candle timestamp
+            interval_minutes: Candle interval (5 for 5-minute candles)
+            trigger_callbacks: Whether to trigger callbacks when candle completes
+        """
+        # Only support 5-minute candles for now
+        if interval_minutes != 5:
+            return
+        
+        current_candles = self.current_5min_candles
+        completed_candles = self.completed_5min_candles
+        callbacks = self.on_5min_candle_callbacks
+        
+        # Convert to timezone-naive if needed
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
+        
+        # Round timestamp to 5-minute interval
+        candle_time = timestamp.replace(
+            minute=(timestamp.minute // 5) * 5,
+            second=0,
+            microsecond=0
+        )
+        
+        # Check if we need to start a new candle
+        if token not in current_candles:
+            # First candle for this token
+            current_candles[token] = {
+                'open': candle_data['open'],
+                'high': candle_data['high'],
+                'low': candle_data['low'],
+                'close': candle_data['close'],
+                'timestamp': candle_time,
+                'token': token
+            }
+        else:
+            current_candle = current_candles[token]
+            
+            # Check if new 5-minute candle period started
+            if candle_time > current_candle['timestamp']:
+                # Save completed candle
+                completed_candles[token].append(current_candle.copy())
+                
+                # Save to CSV
+                instrument_name = self.token_instrument_names.get(token)
+                self.data_storage.save_5min_candle(token, current_candle.copy(), instrument_name)
+                
+                # Trigger callbacks if enabled
+                if trigger_callbacks:
+                    for callback in callbacks:
+                        callback(token, current_candle.copy())
+                
+                # Start new 5-minute candle
+                current_candles[token] = {
+                    'open': candle_data['open'],
+                    'high': candle_data['high'],
+                    'low': candle_data['low'],
+                    'close': candle_data['close'],
+                    'timestamp': candle_time,
+                    'token': token
+                }
+            else:
+                # Update current 5-minute candle by aggregating OHLC
+                # Keep the first open, update high/low, use latest close
+                current_candle['high'] = max(current_candle['high'], candle_data['high'])
+                current_candle['low'] = min(current_candle['low'], candle_data['low'])
+                current_candle['close'] = candle_data['close']
+    
     def _update_candle(self, token: int, ltp: float, timestamp: datetime, interval_minutes: int):
         """Update candle for given interval"""
         
@@ -54,6 +190,10 @@ class CandleAggregator:
             callbacks = self.on_5min_candle_callbacks
         else:
             return
+        
+        # Convert to timezone-naive if needed (for consistent comparison)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.replace(tzinfo=None)
         
         # Round timestamp to candle interval
         candle_time = timestamp.replace(
@@ -80,6 +220,13 @@ class CandleAggregator:
             if candle_time > current_candle['timestamp']:
                 # Save completed candle
                 completed_candles[token].append(current_candle.copy())
+                
+                # Save to CSV file
+                instrument_name = self.token_instrument_names.get(token)
+                if interval_minutes == 1:
+                    self.data_storage.save_1min_candle(token, current_candle.copy(), instrument_name)
+                elif interval_minutes == 5:
+                    self.data_storage.save_5min_candle(token, current_candle.copy(), instrument_name)
                 
                 # Call callbacks
                 for callback in callbacks:
@@ -126,16 +273,24 @@ class CandleAggregator:
         
         # Apply time filters during candle selection (efficient)
         if start_time or end_time:
+            # Ensure filter times are timezone-naive for comparison
+            if start_time and start_time.tzinfo is not None:
+                start_time = start_time.replace(tzinfo=None)
+            if end_time and end_time.tzinfo is not None:
+                end_time = end_time.replace(tzinfo=None)
+            
             filtered_candles = []
             for candle in candles:
                 candle_time = candle['timestamp']
                 
-                # Check start time
+                # Check start time (inclusive: candle_time >= start_time)
                 if start_time and candle_time < start_time:
                     continue
                 
-                # Check end time
-                if end_time and candle_time > end_time:
+                # Check end time (exclusive: candle_time < end_time)
+                # This ensures we get candles BEFORE end_time, not including it
+                # Example: end_time=10:00 will include 09:45, 09:50, 09:55 but NOT 10:00
+                if end_time and candle_time >= end_time:
                     continue
                 
                 filtered_candles.append(candle)

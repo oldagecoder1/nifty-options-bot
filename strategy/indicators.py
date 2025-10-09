@@ -7,23 +7,28 @@ from typing import Optional
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
     """
-    Calculate RSI (Relative Strength Index)
-    
+    Calculate RSI (Relative Strength Index) using Wilder's smoothing.
+
     Args:
         data: Price data series
         period: RSI period (default 14)
-    
+
     Returns:
         RSI series
     """
     delta = data.diff()
-    
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    
-    rs = gain / loss
+
+    # Separate positive and negative changes
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # Wilder's smoothing (equivalent to an EMA with alpha = 1 / period)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    
+
     return rsi
 
 def get_latest_rsi(df: pd.DataFrame, price_column: str = 'close', period: int = 14) -> Optional[float]:

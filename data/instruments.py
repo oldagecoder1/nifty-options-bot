@@ -5,9 +5,9 @@ import pandas as pd
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from config.settings import settings
-from utils.logger import get_logger
+from utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger('InstrumentManager', level='INFO')
 
 class InstrumentManager:
     """Manage instruments and strike selection"""
@@ -76,12 +76,20 @@ class InstrumentManager:
         if from_date is None:
             from_date = datetime.now()
         
-        # Get unique expiry dates
-        expiries = sorted(self.instruments_df['expiry'].unique())
+        # Filter only option instruments (CE/PE), exclude index/equity
+        options_df = self.instruments_df[
+            self.instruments_df['option_type'].isin(['CE', 'PE'])
+        ]
         
-        # Find nearest expiry >= from_date
+        # Get unique expiry dates from options only
+        expiries = sorted(options_df['expiry'].unique())
+        
+        # Compare only dates (not time) to find nearest expiry >= today
+        from_date_only = from_date.date() if hasattr(from_date, 'date') else from_date
+        
         for expiry in expiries:
-            if expiry >= from_date:
+            expiry_date = expiry.date() if hasattr(expiry, 'date') else expiry
+            if expiry_date >= from_date_only:
                 logger.info(f"Nearest weekly expiry: {expiry.date()}")
                 return expiry
         
@@ -139,6 +147,41 @@ class InstrumentManager:
         
         logger.warning("Nifty spot token not found in instruments CSV")
         return None
+    
+    def get_trading_symbol(self, token: int) -> Optional[str]:
+        """
+        Get trading symbol for a given token
+        
+        Args:
+            token: Instrument token
+            
+        Returns:
+            Trading symbol with exchange prefix (e.g., 'NSE:NIFTY 50' or 'NFO:NIFTY25O0725000CE')
+        """
+        try:
+            instrument = self.instruments_df[self.instruments_df['token'] == token]
+            
+            if not instrument.empty:
+                row = instrument.iloc[0]
+                symbol = row['symbol']
+                option_type = row['option_type']
+                
+                # Determine exchange based on option type
+                if option_type == 'EQ' or option_type == 'INDEX':
+                    exchange = 'NSE'
+                elif option_type in ['CE', 'PE']:
+                    exchange = 'NFO'
+                else:
+                    exchange = 'NFO'  # Default to NFO
+                
+                return f"{exchange}:{symbol}"
+            
+            logger.warning(f"Trading symbol not found for token {token}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting trading symbol for token {token}: {e}")
+            return None
     
     def validate_strike_liquidity(self, strike: int, option_type: str) -> bool:
         """

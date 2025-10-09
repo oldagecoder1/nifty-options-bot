@@ -81,10 +81,10 @@ class Backtester:
         return resampled
     
     def calculate_reference_levels(self, df: pd.DataFrame, date: str) -> Optional[ReferenceLevels]:
-        """Calculate reference levels from 10:00-10:15 candle"""
+        """Calculate reference levels from 09:45-10:00 candle"""
         try:
-            ref_start = pd.Timestamp(f"{date} 10:00:00")
-            ref_end = pd.Timestamp(f"{date} 10:15:00")
+            ref_start = pd.Timestamp(f"{date} 09:45:00")
+            ref_end = pd.Timestamp(f"{date} 09:59:59")
             
             ref_data = df.loc[ref_start:ref_end]
             
@@ -179,8 +179,8 @@ class Backtester:
         rsi_peak = None
         max_price = None
         
-        # Filter trading hours (10:15 onwards)
-        trading_data = df[df.index.time >= time(10, 15)]
+        # Filter trading hours (10:00 onwards)
+        trading_data = df[df.index.time >= time(10, 0)]
         
         for idx, row in trading_data.iterrows():
             current_time = idx.time()

@@ -1,12 +1,12 @@
 """
-Calculate and store reference levels from 10:00-10:15 candle
+Calculate and store reference levels from 09:45-10:00 candle
 """
 from typing import Dict, Optional
 import pandas as pd
 from dataclasses import dataclass
-from utils.logger import get_logger
+from utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger('ReferenceCalculator', level='INFO')
 
 @dataclass
 class ReferenceLevels:
@@ -34,7 +34,7 @@ class ReferenceLevels:
         )
 
 class ReferenceCalculator:
-    """Calculate reference levels from the 10:00-10:15 candle"""
+    """Calculate reference levels from the 09:45-10:00 candle"""
     
     def __init__(self):
         self.levels: Optional[ReferenceLevels] = None
@@ -49,9 +49,9 @@ class ReferenceCalculator:
         Calculate reference levels from 15-min candle data
         
         Args:
-            nifty_df: Nifty OHLC data for 10:00-10:15
-            call_df: Call option OHLC data for 10:00-10:15
-            put_df: Put option OHLC data for 10:00-10:15
+            nifty_df: Nifty OHLC data for 09:45-10:00
+            call_df: Call option OHLC data for 09:45-10:00
+            put_df: Put option OHLC data for 09:45-10:00
         
         Returns:
             ReferenceLevels object
@@ -77,8 +77,10 @@ class ReferenceCalculator:
             RP=RP, GP=GP, BP=BP
         )
         
-        logger.info("Reference levels calculated:")
-        logger.info(f"\n{self.levels}")
+        logger.info("✅ Reference levels calculated:")
+        logger.info(f"   Nifty: RN={self.levels.RN:.2f}, GN={self.levels.GN:.2f}, BN={self.levels.BN:.2f}")
+        logger.info(f"   Call:  RC={self.levels.RC:.2f}, GC={self.levels.GC:.2f}, BC={self.levels.BC:.2f}")
+        logger.info(f"   Put:   RP={self.levels.RP:.2f}, GP={self.levels.GP:.2f}, BP={self.levels.BP:.2f}")
         
         return self.levels
     

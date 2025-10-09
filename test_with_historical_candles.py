@@ -255,19 +255,23 @@ class HistoricalTester:
     
     def _process_5min_candle(self, candle_time):
         """Process every 5 minutes: build 5-min Nifty candle and drive entries."""
-        # Build 5-min candle from the last 5 x 1-min candles (inclusive)
-        # Example: at 10:25, we want 10:21..10:25 (5 bars) → subtract 4 minutes
-        start_time = candle_time - pd.Timedelta(minutes=4)
+        # Build 5-min candle from the previous five completed 1-min candles
+        # Example: when candle_time is 10:15, use 10:10..10:14 inclusive
+        window_end = candle_time - pd.Timedelta(minutes=1)
+        window_start = window_end - pd.Timedelta(minutes=4)
 
         levels = reference_calculator.get_levels()
         if not levels:
             return
 
+        if window_end < window_start:
+            return
+
         # --- Nifty 5-min candle ---
         nifty_candles = candle_aggregator.get_candles_for_period(
-            self.nifty_token, start_time, candle_time, '1min'
+            self.nifty_token, window_start, window_end, '1min'
         )
-        if len(nifty_candles) == 0:
+        if len(nifty_candles) < 5:
             return
 
         nifty_5min = {
@@ -287,9 +291,9 @@ class HistoricalTester:
                 # Build option 5-min candle to get entry price (no breakout/confirm on options now)
                 option_token = self.call_token if side == 'CALL' else self.put_token
                 option_candles = candle_aggregator.get_candles_for_period(
-                    option_token, start_time, candle_time, '1min'
+                    option_token, window_start, window_end, '1min'
                 )
-                if len(option_candles) == 0:
+                if len(option_candles) < 5:
                     return
 
                 option_5min = {
@@ -325,7 +329,7 @@ class HistoricalTester:
 
         option_5min = (
             option_df
-            .resample('5min', label='right', closed='right')
+            .resample('5min', label='right', closed='left')
             .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'})
             .dropna()
         )
@@ -410,7 +414,7 @@ class HistoricalTester:
         self.current_trade_id = None
         self.current_side = None
         stop_loss_manager.reset()
-        breakout_detector.reset_all()
+        breakout_detector.notify_position_closed()
 
 def main():
     import argparse

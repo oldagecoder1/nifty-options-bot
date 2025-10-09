@@ -1,14 +1,14 @@
 """
 Breakout and confirmation detection logic
-(Updated to post-10:15 two-candle confirmation on Nifty 5-minute candles)
+(Updated to post-10:00 two-candle confirmation on Nifty 5-minute candles)
 """
 from typing import Optional, Literal
 from dataclasses import dataclass
 from datetime import time
 import pandas as pd
-from utils.logger import get_logger
+from utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger('BreakoutDetector', level='INFO')
 
 TradeSide = Literal['CALL', 'PUT', 'NONE']
 
@@ -22,7 +22,7 @@ class BreakoutState:
 
 class BreakoutDetector:
     """
-    Detect entries using *Nifty 5-minute* two-candle confirmation AFTER 10:15:
+    Detect entries using *Nifty 5-minute* two-candle confirmation AFTER 10:00:
       - CALL: candle k close > RN AND candle k+1 close > RN AND > k close
       - PUT : candle k close < GN AND candle k+1 close < GN AND < k close
 
@@ -42,8 +42,10 @@ class BreakoutDetector:
         # NEW: state for the two-candle confirmation logic
         self._prev_nifty5: Optional[pd.Series] = None  # previous completed 5m Nifty candle
         self._armed: bool = False                      # can take a fresh entry?
-        self._trading_window_open: bool = False        # true after 10:15 (based on candle ts)
-        self._trade_start_time: time = time(10, 00)    # 10:15
+        self._trading_window_open: bool = False        # true after 10:00 (based on candle ts)
+        self._trade_start_time: time = time(10, 0)     # 10:00
+        self._call_rearm_pending: bool = False         # require close back below RN before new CALL entry attempt
+        self._put_rearm_pending: bool = False          # require close back above GN before new PUT entry attempt
 
     # -------------------- new helpers --------------------
 
@@ -53,13 +55,26 @@ class BreakoutDetector:
         to re-arm the detector for the next setup.
         """
         if self._trading_window_open:
+            if self.current_side == 'CALL':
+                # require Nifty to close back below RN before next CALL entry
+                self._call_rearm_pending = True
+            elif self.current_side == 'PUT':
+                # require Nifty to close back above GN before next PUT entry
+                self._put_rearm_pending = True
             self._armed = True
-            logger.info("Re-armed after position closed.")
+            self._prev_nifty5 = None  # force fresh two-candle sequence post-exit
+            logger.info(
+                "Re-armed after position closed. Rearm pending: CALL=%s, PUT=%s",
+                self._call_rearm_pending,
+                self._put_rearm_pending,
+            )
+            # clear current side after recording which flag was set
+            self.current_side = 'NONE'
 
     def _past_start_time(self, dt) -> bool:
         """
         dt: pandas.Timestamp or datetime from the Nifty candle.
-        Returns True once local time is >= 10:15.
+        Returns True once local time is >= 10:00.
         """
         # pandas.Timestamp has .time(); naive or tz-aware works for local-market backtests.
         try:
@@ -92,14 +107,14 @@ class BreakoutDetector:
         ts = nifty_candle['timestamp']
         close = float(nifty_candle['close'])
 
-        # 1) open trading window after 10:15
+        # 1) open trading window after 10:00
         if not self._trading_window_open:
             if self._past_start_time(ts):
                 self._trading_window_open = True
                 self._armed = True  # arm immediately once window opens
-                logger.info("Trading window opened (>= 10:15) and armed.")
+                logger.info("Trading window opened (>= 10:00) and armed.")
             else:
-                # before 10:15, just buffer last candle
+                # before 10:00, just buffer last candle
                 self._prev_nifty5 = nifty_candle
                 return 'NONE'
 
@@ -115,7 +130,49 @@ class BreakoutDetector:
 
         prev = self._prev_nifty5
         prev_close = float(prev['close'])
+        prev_ts = prev.get('timestamp') if isinstance(prev, (pd.Series, dict)) else None
         logger.info(f"Nifty candle: {ts}: {prev_close:.2f} → {close:.2f}")
+
+        # Handle re-arm gating based on post-exit conditions
+        if self._call_rearm_pending:
+            if prev_close <= RN and close <= RN:
+                # price has closed back below RN on both candles since exit
+                self._call_rearm_pending = False
+                logger.info(
+                    "CALL rearm condition satisfied: prev_close=%.2f, close=%.2f <= RN=%.2f",
+                    prev_close,
+                    close,
+                    RN,
+                )
+            else:
+                logger.debug(
+                    "CALL rearm pending. Need closes <= RN. prev_close=%.2f, close=%.2f, RN=%.2f",
+                    prev_close,
+                    close,
+                    RN,
+                )
+                self._prev_nifty5 = nifty_candle
+                return 'NONE'
+
+        if self._put_rearm_pending:
+            if prev_close >= GN and close >= GN:
+                # price has closed back above GN on both candles since exit
+                self._put_rearm_pending = False
+                logger.info(
+                    "PUT rearm condition satisfied: prev_close=%.2f, close=%.2f >= GN=%.2f",
+                    prev_close,
+                    close,
+                    GN,
+                )
+            else:
+                logger.debug(
+                    "PUT rearm pending. Need closes >= GN. prev_close=%.2f, close=%.2f, GN=%.2f",
+                    prev_close,
+                    close,
+                    GN,
+                )
+                self._prev_nifty5 = nifty_candle
+                return 'NONE'
 
         # ---- Two-candle confirmation checks (strict inequalities) ----
         # CALL: prev.close > RN AND curr.close > RN AND curr.close > prev.close
@@ -192,7 +249,7 @@ class BreakoutDetector:
         logger.info(f"Breakout state reset for {side}")
 
     def reset_all(self):
-        """Reset all states and disarm until 10:15 logic opens again."""
+        """Reset all states and disarm until 10:00 logic opens again."""
         self.call_breakout = BreakoutState()
         self.put_breakout = BreakoutState()
         self.current_side = 'NONE'

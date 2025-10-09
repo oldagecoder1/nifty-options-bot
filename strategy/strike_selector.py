@@ -5,9 +5,9 @@ from typing import Dict, Optional, Tuple
 from config.settings import settings
 from data.instruments import instrument_manager
 from utils.helpers import round_to_nearest
-from utils.logger import get_logger
+from utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger('StrikeSelector', level='INFO')
 
 class StrikeSelector:
     """Select Call and Put strikes based on Nifty spot"""
